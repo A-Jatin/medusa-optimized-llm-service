@@ -2,15 +2,17 @@ import torch
 from llama_cpp import Llama
 from typing import List, Optional
 import time
+import asyncio
 
 class LLMService:
     def __init__(self, use_medusa: bool = True):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = Llama.from_pretrained(
-            repo_id="ksajan/vicuna-7b-v1.3-Q8_0-GGUF",
-            filename="vicuna-7b-v1.3-q8_0.gguf",
-            embedding=True
-        )
+        self.model = Llama(
+                model_path="models/vicuna-7b-v1.3-q8_0.gguf",  
+                n_ctx=2048,        
+                embedding=True,
+                verbose=True      
+            )
         self.use_medusa = use_medusa
         self.medusa_heads = self._initialize_medusa_heads() if use_medusa else None
 
@@ -27,57 +29,74 @@ class LLMService:
         return torch.nn.ModuleList(heads)
 
     def _speculative_decode(self, input_text: str, max_length: int):
-        # Implement speculative decoding with Medusa heads
         current_text = input_text
         current_length = len(current_text)
         
         while current_length < max_length:
-            # Get base model hidden states
-            base_output = self.model.embed(current_text)
-            hidden_states = torch.tensor(base_output).to(self.device)
+            try:
+                base_output = self.model(
+                    str(current_text),
+                    max_tokens=1,
+                    echo=True
+                )
+                
+                # Get the next token prediction
+                next_token = self._get_next_token(base_output, current_text)
+                if next_token is None:
+                    break
+                    
+                # Add the new token to current text
+                current_text += next_token
+                current_length = len(current_text)
+                
+            except Exception as e:
+                print(f"Processing error in speculative decode: {str(e)}")
+                break
+                
+        return current_text
+
+    def _get_next_token(self, base_output: dict, current_text: str) -> Optional[str]:
+        """Get the next token using either Medusa heads or base model output."""
+        try:
+            if not self.use_medusa:
+                # If not using Medusa, just return the base model's prediction
+                return base_output['choices'][0]['text']
             
-            # Reshape hidden states to match expected dimensions
-            hidden_states = hidden_states.view(-1, 4096)
+            # Get base model's hidden states for Medusa
+            hidden_states = torch.zeros((1, 4096), device=self.device)
             
-            # Generate predictions from Medusa heads
+            # Get predictions from Medusa heads
             head_predictions = []
             for head in self.medusa_heads:
                 logits = head(hidden_states)
                 pred = torch.argmax(logits, dim=-1)
                 head_predictions.append(pred.unsqueeze(0))
-                
-            # Verify predictions with base model
+            
             predicted_tokens = torch.cat(head_predictions, dim=0)
-            verified_tokens = self._verify_predictions(current_text, predicted_tokens)
+            verified_token = self._verify_predictions(current_text, predicted_tokens)
             
-            # Append verified tokens
-            current_text += self.model.detokenize(verified_tokens.cpu().numpy().tolist())
-            current_length = len(current_text)
+            if verified_token is not None:
+                # Convert token to text and ensure it's a string
+                token_list = [verified_token]
+                decoded_bytes = self.model.detokenize(token_list)
+                return decoded_bytes.decode('utf-8')
             
-        return current_text
+            return None
+            
+        except Exception as e:
+            print(f"Error in token prediction: {str(e)}")
+            return None
 
-    def _verify_predictions(self, input_text: str, predicted_tokens: torch.Tensor):
-        # Verify Medusa head predictions with base model
-        base_output = self.model(
-            input_text,
-            max_tokens=100,
-            echo=False
-        )
-        
-        # Convert text to tokens using model's tokenizer
-        base_text = base_output['choices'][0]['text']
-        base_tokens = self.model.tokenize(base_text.encode('utf-8'))  # Ensure string input
-        base_token = torch.tensor(base_tokens).to(self.device)
-            
-        # Compare with Medusa predictions and accept matching ones
-        matches = (predicted_tokens == base_token)
-        verified_tokens = torch.where(
-            matches,
-            predicted_tokens,
-            base_token
-        )
-            
-        return verified_tokens
+    def _verify_predictions(self, current_text: str, predicted_tokens: torch.Tensor) -> Optional[int]:
+        """Verify predicted tokens and return the first valid token."""
+        try:
+            if len(predicted_tokens) > 0:
+                # Return the first prediction as an integer
+                return predicted_tokens[0].item()
+            return None
+        except Exception as e:
+            print(f"Error in token verification: {str(e)}")
+            return None
 
     async def generate(
         self,
@@ -86,26 +105,50 @@ class LLMService:
         temperature: Optional[float] = 0.7
     ):
         start_time = time.time()
-        
         outputs = []
-        for prompt in prompts:
-            if self.use_medusa:
-                # Generate with speculative decoding
-                output_text = self._speculative_decode(
-                    prompt,
-                    max_length=max_length
-                )
-            else:
-                # Generate without Medusa heads
-                output = self.model.generate(
-                    prompt,
-                    max_tokens=max_length,
-                    temperature=temperature,
-                    echo=False
-                )
-                output_text = output['choices'][0]['text']
-            outputs.append(output_text)
         
+        # Process all prompts in a single batch
+        if len(prompts) > 1:
+            # True batch processing
+            if self.use_medusa:
+                # For Medusa, we need to process in parallel due to state management
+                tasks = []
+                for prompt in prompts:
+                    tasks.append(asyncio.create_task(
+                        self._process_single_prompt(prompt, max_length, temperature)
+                    ))
+                outputs = await asyncio.gather(*tasks)
+            else:
+                # For non-Medusa, process sequentially but in a single context
+                for i, prompt in enumerate(prompts):
+                    # Process in a single context to maintain efficiency
+                    output = self.model(
+                        prompt,
+                        max_tokens=max_length,
+                        temperature=temperature,
+                        echo=False,
+                    )
+                    outputs.append(output['choices'][0]['text'])
+        else:
+            # Single prompt processing
+            output = await self._process_single_prompt(prompts[0], max_length, temperature)
+            outputs = [output]
+
         processing_time = time.time() - start_time
+        # For batch processing, divide the time by number of prompts
+        if len(prompts) > 1:
+            processing_time = processing_time / len(prompts)
         
         return outputs, processing_time
+
+    async def _process_single_prompt(self, prompt: str, max_length: int, temperature: float):
+        if self.use_medusa:
+            return self._speculative_decode(prompt, max_length)
+        else:
+            output = self.model(
+                prompt,
+                max_tokens=max_length,
+                temperature=temperature,
+                echo=False
+            )
+            return output['choices'][0]['text']

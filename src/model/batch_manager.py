@@ -38,25 +38,30 @@ class DynamicBatchManager:
 
     async def _process_batch(self, llm_service: Any):
         while self.request_queue:
-            # Collect batch of requests
             batch = []
             futures = []
             batch_start_time = time.time()
             
+            # Collect requests for the batch
             while (
-                len(batch) < self.max_batch_size and
-                self.request_queue and
-                time.time() - batch_start_time < self.max_wait_time
+                self.request_queue and 
+                len(batch) < self.max_batch_size and 
+                (time.time() - batch_start_time) < self.max_wait_time
             ):
                 request, future = self.request_queue.popleft()
                 batch.append(request)
                 futures.append(future)
+                
+                # Small delay to allow more requests to accumulate
+                if len(batch) < self.max_batch_size:
+                    await asyncio.sleep(0.001)
             
-            # Process batch
+            # Process the batch
             try:
                 prompts = [req.prompt for req in batch]
-                max_length = max(req.max_length for req in batch)
-                temperature = sum(req.temperature for req in batch) / len(batch)
+                # Use the parameters from the first request for consistency
+                max_length = batch[0].max_length
+                temperature = batch[0].temperature
                 
                 outputs, processing_time = await llm_service.generate(
                     prompts=prompts,
@@ -64,11 +69,11 @@ class DynamicBatchManager:
                     temperature=temperature
                 )
                 
-                # Set results
-                for future, output in zip(futures, outputs):
+                # Set results for all requests in the batch
+                for i, (future, output) in enumerate(zip(futures, outputs)):
                     future.set_result({
                         "text": output,
-                        "processing_time": processing_time
+                        "processing_time": processing_time  # Each request gets the per-item processing time
                     })
                     
             except Exception as e:
@@ -77,4 +82,12 @@ class DynamicBatchManager:
                     if not future.done():
                         future.set_exception(e)
         
+        self.processing = False
+
+    async def cleanup(self):
+        """Clean up any pending requests and reset processing state."""
+        while self.request_queue:
+            request, future = self.request_queue.popleft()
+            if not future.done():
+                future.set_exception(Exception("Batch manager cleanup - request cancelled"))
         self.processing = False

@@ -2,10 +2,17 @@ from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 from typing import List, Optional
 import uvicorn
-from model.llm import LLMService
-from model.batch_manager import DynamicBatchManager
+from src.model.llm import LLMService
+from src.model.batch_manager import DynamicBatchManager
 
 app = FastAPI(title="LLM Service with Medusa Head")
+
+# Create singleton instances
+llm_service = LLMService()
+batch_manager = DynamicBatchManager(
+    max_batch_size=8,  # Increased for better throughput
+    max_wait_time=0.1  # Increased to allow more batching
+)
 
 class GenerationRequest(BaseModel):
     prompt: str
@@ -20,10 +27,10 @@ class GenerationResponse(BaseModel):
 
 @app.post("/generate", response_model=GenerationResponse)
 async def generate_text(request: GenerationRequest, background_tasks: BackgroundTasks):
-    # Create service instances with requested settings
-    service = LLMService(use_medusa=request.use_medusa)
-    manager = DynamicBatchManager(use_batching=request.use_batching)
-    return await manager.process_request(request, service)
+    # Update service settings
+    llm_service.use_medusa = request.use_medusa
+    batch_manager.use_batching = request.use_batching
+    return await batch_manager.process_request(request, llm_service)
 
 @app.get("/health")
 async def health_check():
