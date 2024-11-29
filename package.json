@@ -1,0 +1,7 @@
+{
+  "name": "llm-fastapi-service",
+  "private": true,
+  "scripts": {
+    "start": "echo 'This project requires a Python environment with GPU support. Please use Google Colab or Kaggle Notebooks as described in the README.md'"
+  }
+}
